@@ -11,4 +11,4 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
-staticPublishPath: build
+    staticPublishPath: build
