@@ -1,0 +1,9 @@
+Flask
+Flask-Cors
+werkzeug
+pandas
+openpyxl
+fastapi
+pydantic
+uvicorn
+numpy
