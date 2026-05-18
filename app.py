@@ -5,9 +5,25 @@ import re
 import pdb
 import openpyxl
 import numpy as np
+from flask import send_from_directory
+import os
 
 app = Flask(__name__)
 CORS(app)
+
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory(os.path.join('build', 'static'), filename)
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react(path):
+    if path != "" and os.path.exists(os.path.join("build", path)):
+        return send_from_directory("build", path)
+    else:
+        return send_from_directory("build", "index.html")
+
 
 @app.route('/api/add', methods=['POST'])
 def add_numbers():
@@ -332,21 +348,6 @@ def get_portfolio_summary():
     agg = aggregate_cashflows(flows)
     summary = portfolio_summary(agg, df)
     return jsonify(summary)
-
-from flask import send_from_directory
-import os
-
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory(os.path.join("build", "static"), filename)
-
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_react(path):
-    if path != "" and os.path.exists(os.path.join('build', path)):
-        return send_from_directory('build', path)
-    else:
-        return send_from_directory('build', 'index.html')
 
     
 if __name__ == '__main__':
