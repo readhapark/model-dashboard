@@ -24,7 +24,6 @@ def serve_react(path):
     else:
         return send_from_directory("build", "index.html")
 
-
 @app.route('/api/add', methods=['POST'])
 def add_numbers():
     data = request.get_json()
@@ -349,7 +348,18 @@ def get_portfolio_summary():
     summary = portfolio_summary(agg, df)
     return jsonify(summary)
 
-    
+@app.route("/debug")
+def debug():
+    import os
+    return {
+        "cwd": os.getcwd(),
+        "files": os.listdir(os.getcwd()),
+        "parent_files": os.listdir(os.path.dirname(os.getcwd())),
+        "build_exists_here": os.path.exists("build"),
+        "build_exists_parent": os.path.exists("../build"),
+        "build_static_exists": os.path.exists("build/static"),
+    }
+
 if __name__ == '__main__':
     
     app.run(debug=True)
