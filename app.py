@@ -1,371 +1,581 @@
-from flask import Flask, jsonify, request
+import math
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import pandas as pd
-import re
-import pdb
-import openpyxl
 import numpy as np
-from flask import send_from_directory
+import re
 import os
-import math
+from pyxirr import xirr
 
-app = Flask(__name__, static_folder='build/static', static_url_path='/static')
+app = Flask(__name__, static_folder="build/static", static_url_path="/static")
 CORS(app)
-# Serve static files from React build
+
+###############################################################################
+# STATIC ROUTES
+###############################################################################
+
 @app.route('/static/<path:path>')
 def serve_static(path):
-    return send_from_directory(os.path.join('build', 'static'), path)
-# Serve React App
+    return send_from_directory(os.path.join("build", "static"), path)
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_react(path):
-    full_path = os.path.join('build', path)
-    if path != "" and os.path.exists(full_path):
-        return send_from_directory('build', path)
-    return send_from_directory('build', 'index.html')
+    fp = os.path.join("build", path)
+    if path != "" and os.path.exists(fp):
+        return send_from_directory("build", path)
+    return send_from_directory("build", "index.html")
 
-@app.route('/api/add', methods=['POST'])
-def add_numbers():
-    data = request.get_json()
-    a = data.get('a')
-    b = data.get('b')
-    if a is None or b is None:
-        return jsonify({"error": "Missing parameters 'a' and 'b'"}), 400
-    try:
-        result = float(a) + float(b)
-    except ValueError:
-        return jsonify({"error": "Invalid input"}), 400
-    return jsonify({"result": result})
+###############################################################################
+# LOAD ASSETS
+###############################################################################
 
-def load_assets_excel(file_path='assets.xlsx'):
+def load_assets_excel(file_path="assets.xlsx"):
     df = pd.read_excel(file_path)
-    # Clean column names: remove spaces and symbols, keep letters, numbers, and underscores
-    df.columns = [
-        re.sub(r'\W+', '', col.replace(' ', '_')) for col in df.columns
+
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.replace(r"\s+", "_", regex=True)
+        .str.replace(r"[^\w_]", "", regex=True)
+    )
+
+    df["Initial_Funding_Date"] = pd.to_datetime(df["Initial_Funding_Date"], dayfirst=True, errors="coerce")
+    df["Exit_Date"] = pd.to_datetime(df["Exit_Date"], dayfirst=True, errors="coerce")
+
+    numeric_cols = [
+        "Funded_EUR","Committed_EUR","Margin","Base_Rate","PIK",
+        "Unfunded_Fee__of_margin","Day_Basis"
     ]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
     return df
 
-
-def load_fund_excel(file_path='fund_terms.xlsx'):
-    df = pd.read_excel(file_path)
-    # Clean column names: remove spaces and symbols, keep letters, numbers, and underscores
-    df.columns = [
-        re.sub(r'\W+', '', col.replace(' ', '_')) for col in df.columns
-    ]
-    return df
+###############################################################################
+# /api/read_assets
+###############################################################################
 
 @app.route('/api/read_assets', methods=['GET'])
-def read_assets_excel(file_path='assets.xlsx'):
-    try:
-        df = load_assets_excel()
-        data = df.to_dict(orient='records')
-        columns = list(df.columns)
-        return jsonify({"data": data, "columns": columns})
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
-        return jsonify({"error": str(e)}), 500
+def api_read_assets():
+    df = load_assets_excel()
+    return jsonify({
+        "data": df.to_dict("records"),
+        "columns": list(df.columns)
+    })
 
-def generate_monthly_cashflows(df):
-    """
-    Monthly loan-level cashflows:
-    - Cash interest
-    - PIK interest (capitalised monthly)
-    - Unfunded fees
-    - Updated balances
-    - Guaranteed principal repayment at exit
-    """
+###############################################################################
+# MONTHLY CASHFLOWS â€” bullet repayment once at exit
+###############################################################################
 
+def generate_monthly_cashflows(df, exit_multiple=1.0):
     flows = []
 
-    for _, row in df.iterrows():
+    for row in df.itertuples(index=False):
 
-        # Extract core loan fields
-        model_ref = row['Model_Ref']
-        funded = float(row['Funded_EUR'])
-        committed = float(row['Committed_EUR'])
-        unfunded = committed - funded
+        funded    = row.Funded_EUR
+        committed = row.Committed_EUR
+        unfunded  = committed - funded
 
-        base_rate = float(row['Base_Rate'])
-        cash_margin = float(row['Margin'])
-        pik_margin = float(row.get('PIK', 0))
+        cash_rate = row.Base_Rate + row.Margin
+        pik_rate  = row.PIK
+        uf_rate   = row.Unfunded_Fee__of_margin * row.Margin
+        day_basis = row.Day_Basis
 
-        # Rates
-        cash_rate = base_rate + cash_margin
-        pik_rate = pik_margin
+        start_date = row.Initial_Funding_Date
+        exit_date  = row.Exit_Date
 
-        # Unfunded fee (corrected double-underscore version)
-        unfunded_fee_rate = float(row['Unfunded_Fee__of_margin']) * cash_margin
+        start_month = start_date.replace(day=1)
+        ms_end      = exit_date.replace(day=1)
 
-        day_basis = float(row['Day_Basis'])
+        month_starts = pd.date_range(start=start_month, end=ms_end, freq="MS")
 
-        company = row['Company__Issuer_Name']
-        instrument = row['Instrument_Name']
-        ccy = row['Ccy']
+        # If exit date is midâ€‘month, include it
+        if exit_date != ms_end:
+            month_starts = month_starts.append(pd.DatetimeIndex([exit_date]))
 
-        # Dates
-        start_date = pd.to_datetime(row['Initial_Funding_Date'])
-        exit_date = pd.to_datetime(row['Exit_Date'])    # correct
-
-        # Generate month ends from funding month → exit month
-        month_starts = pd.date_range(
-            start=start_date.to_period("M").to_timestamp(),
-            end=exit_date.to_period("M").to_timestamp(),
-            freq="MS"
-        )
-
-        principal = funded  # starting balance including PIK
+        principal = funded
 
         for dt in month_starts:
 
+            # Exit row â€” repay once and stop
+            if dt == exit_date:
+                flows.append({
+                    "Date": exit_date,
+                    "Balance_Start_EUR": principal,
+                    "Interest_Cash_EUR": 0,
+                    "Interest_PIK_EUR": 0,
+                    "Unfunded_Fee_EUR": 0,
+                    "Principal_EUR": principal * exit_multiple,
+                    "Balance_End_EUR": 0
+                })
+                principal = 0
+                break
+
             period_start = dt
             period_end = dt + pd.offsets.MonthEnd(1)
-            period_end = min(period_end, exit_date)  # clamp to exit
+            if period_end > exit_date:
+                period_end = exit_date
 
             days = (period_end - period_start).days
+            bal_start = principal
 
-            balance_start = principal
+            int_cash = bal_start * cash_rate * days / day_basis
+            int_pik  = bal_start * pik_rate  * days / day_basis
+            bal_after_pik = bal_start + int_pik
 
-            # Cash interest
-            interest_cash = balance_start * cash_rate * days / day_basis
+            unf_fee = unfunded * uf_rate * days / day_basis
 
-            # PIK interest capitalised monthly
-            interest_pik = balance_start * pik_rate * days / day_basis
-            principal = balance_start + interest_pik
-
-            # Unfunded fee
-            unf_fee = unfunded * unfunded_fee_rate * days / day_basis
-
-            # Principal repayment (forced on exit period)
-            is_exit_period = (dt == month_starts[-1])
-            principal_repayment = principal if is_exit_period else 0
-            balance_end = 0 if is_exit_period else principal
+            if period_end == exit_date:
+                prin_repay = bal_after_pik * exit_multiple
+                bal_end = 0
+                principal = 0
+            else:
+                prin_repay = 0
+                bal_end = bal_after_pik
+                principal = bal_end
 
             flows.append({
-                'Model_Ref': model_ref,
-                'Date': period_end,
-                'Company': company,
-                'Instrument': instrument,
-                'Currency': ccy,
-
-                'Balance_Start_EUR': balance_start,
-                'Interest_Cash_EUR': interest_cash,
-                'Interest_PIK_EUR': interest_pik,
-                'Unfunded_Fee_EUR': unf_fee,
-
-                'Principal_EUR': principal_repayment,
-                'Balance_End_EUR': balance_end
+                "Date": period_end,
+                "Balance_Start_EUR": bal_start,
+                "Interest_Cash_EUR": int_cash,
+                "Interest_PIK_EUR": int_pik,
+                "Unfunded_Fee_EUR": unf_fee,
+                "Principal_EUR": prin_repay,
+                "Balance_End_EUR": bal_end
             })
 
     return pd.DataFrame(flows)
 
-def aggregate_cashflows(cashflow_df):
-    """
-    Aggregates all cashflows per month.
-    """
-    grouped = (
-        cashflow_df
-        .groupby('Date')[['Balance_Start_EUR','Interest_Cash_EUR', 'Interest_PIK_EUR', 'Unfunded_Fee_EUR', 'Principal_EUR','Balance_End_EUR']]
-        .sum()
-        .reset_index()
-    )
-    return grouped
+###############################################################################
+# CFS SUPPORT
+###############################################################################
 
-def aggregate_cashflows_for_react(cashflow_df):
-    """
-    Returns a pivoted table with:
-    - Dates as columns
-    - Metrics as rows
-    For easy consumption by React frontend.
-    """
-    # First aggregate normal cashflows per month
-    grouped = (
-        cashflow_df
-        .groupby('Date')[[
-            'Balance_Start_EUR',
-            'Interest_Cash_EUR',
-            'Interest_PIK_EUR',
-            'Unfunded_Fee_EUR',
-            'Principal_EUR',
-            'Balance_End_EUR'
-        ]]
-        .sum()
-        .reset_index()
+def aggregate_for_cfs(flows):
+    return (
+        flows.groupby("Date")[[
+            "Balance_Start_EUR","Interest_Cash_EUR",
+            "Interest_PIK_EUR","Unfunded_Fee_EUR",
+            "Principal_EUR","Balance_End_EUR"
+        ]].sum().reset_index()
     )
-    # Pivot into React-friendly shape
-    pivot_df = grouped.set_index('Date').T
-    # Optional: reset index to get "metric" column for React
-    pivot_df = pivot_df.reset_index().rename(columns={'index': 'Metric'})
-    return pivot_df
+
+def pivot_for_highcharts(df):
+    dfp = df.set_index("Date").T
+    return dfp.reset_index().rename(columns={"index":"Metric"})
+
+def to_highcharts(df):
+    categories = [pd.to_datetime(c).strftime("%Y-%m-%d") for c in df.columns[1:]]
+    series = [{"name": r["Metric"], "data":[r[c] for c in df.columns[1:]]}
+              for _, r in df.iterrows()]
+    return {"categories":categories,"series":series}
+
+###############################################################################
+# /api/cfs
+###############################################################################
 
 @app.route('/api/cfs', methods=['GET'])
-def get_initial_cashflows():
+def api_cfs():
     df = load_assets_excel()
     flows = generate_monthly_cashflows(df)
-    pivot = aggregate_cashflows_for_react(flows)
-    return jsonify(to_highcharts_series(pivot))
+    grouped = aggregate_for_cfs(flows)
+    pivot = pivot_for_highcharts(grouped)
+    return jsonify(to_highcharts(pivot))
 
-def to_highcharts_series(pivot_df):
+###############################################################################
+# PORTFOLIO IRR (pyxirr)
+###############################################################################
+
+def build_portfolio_cashflows(flows, loans_df):
     """
-    Converts the pivoted table (Metric × Date columns) into
-    Highcharts-ready JSON structure:
+    Combines:
+      - monthly interest, PIK, fees, principal
+      - initial capital calls (negative)
+      - produces:
+          Gross_Income  = inflows including principal
+          Net_Cashflow  = Gross_Income (same definition)
+    """
 
-    {
-        "categories": [...dates...],
-        "series": [
-            { "name": "Balance_Start_EUR", "data": [...] },
-            { "name": "Interest_Cash_EUR", "data": [...] },
-            ...
-        ]
+    f = flows.copy()
+
+    # Gross Income now includes principal repayments
+    f["Gross_Income"] = (
+        f["Interest_Cash_EUR"] +
+        f["Interest_PIK_EUR"] +
+        f["Unfunded_Fee_EUR"] +
+        f["Principal_EUR"]
+    )
+
+    # Net Cashflow = Gross Income (same meaning for portfolio waterfall)
+    f["Net_Cashflow"] = f["Gross_Income"]
+
+    # Capital calls are still negative
+    calls = loans_df[["Initial_Funding_Date", "Funded_EUR"]].copy()
+    calls = calls.rename(columns={"Initial_Funding_Date": "Date"})
+    calls["Gross_Income"] = 0
+    calls["Net_Cashflow"] = -calls["Funded_EUR"]
+
+    combined = pd.concat([
+        f[["Date", "Gross_Income", "Net_Cashflow"]],
+        calls[["Date", "Gross_Income", "Net_Cashflow"]]
+    ])
+    combined = to_month_end(combined, "Date")
+    return (
+        combined.groupby("Date")
+        [["Gross_Income", "Net_Cashflow"]]
+        .sum()
+        .reset_index()
+        .sort_values("Date")
+    )
+
+def compute_xirr(port_cf, total_funded):
+    print("REEADHA:total_funded:", total_funded)
+    print("REEADHA:port_cf head:\n", port_cf.head())
+    dates = port_cf["Date"].tolist()
+    amounts = [-total_funded] + port_cf["Gross_Income"].tolist()
+
+    cf_map = dict(zip(dates, amounts))
+
+    try:
+        irr_annual = xirr(cf_map)
+    except:
+        return None, None
+
+    irr_monthly = (1 + irr_annual)**(1/12) - 1
+    return irr_monthly, irr_annual
+
+###############################################################################
+# PORTFOLIO SUMMARY (includes WAL)
+###############################################################################
+
+def portfolio_summary(flows, loans, warehouse_advance):
+    total_funded = loans["Funded_EUR"].sum()
+    port_cf = build_portfolio_cashflows(flows, loans)
+    wf = run_waterfall(port_cf, warehouse_advance)
+    lp_performance=compute_lp_performance(wf)
+    irr_m, irr_y = compute_xirr(port_cf, total_funded)
+
+    total_cash = flows["Interest_Cash_EUR"].sum()
+    total_pik  = flows["Interest_PIK_EUR"].sum()
+    total_fee  = flows["Unfunded_Fee_EUR"].sum()
+    total_prin = flows["Principal_EUR"].sum()
+
+    moic = (total_cash + total_pik + total_fee + total_prin) / total_funded if total_funded > 0 else None
+
+    # WAL
+    total_principal = total_prin
+    flows_sorted = flows.sort_values("Date")
+
+    if total_principal > 0:
+        first_year = flows_sorted["Date"].dt.year.min()
+        months_offset = (
+            (flows_sorted["Date"].dt.year - first_year) * 12 +
+            flows_sorted["Date"].dt.month
+        )
+        WAL_months = (flows_sorted["Principal_EUR"] * months_offset).sum() / total_principal
+        WAL_years = WAL_months / 12
+    else:
+        WAL_years = None
+
+    return {
+        "Total_Capital_Funded": total_funded,
+        "Total_Interest_Cash": total_cash,
+        "Total_Interest_PIK": total_pik,
+        "Total_Unfunded_Fees": total_fee,
+        "Total_Principal_Returned": total_prin,
+        "MOIC": moic,
+        "IRR_Monthly": irr_m,
+        "IRR_Annualised": irr_y,
+        "WAL_Years": WAL_years,
+        "LP_Net_IRR": lp_performance.get("LP_Net_IRR", 0.0),
+        "LP_Net_MOIC": lp_performance.get("LP_Net_MOIC", 0.0)
     }
-    """
-    # categories = all date columns (skip the Metric column)
-    #categories = list(pivot_df.columns[1:])
-    categories = [
-        pd.to_datetime(col).strftime("%Y-%m-%d") 
-        for col in pivot_df.columns[1:]
-    ]
-    # metrics = every row
-    series = []
-    for _, row in pivot_df.iterrows():
-        metric = row['Metric']
 
-        # Extract numeric values only for date columns
-        values = [row[col] for col in pivot_df.columns[1:]]
+###############################################################################
+# /api/portfolio_summary
+###############################################################################
 
-        series.append({
-            "name": metric,
-            "data": values
+@app.route('/api/portfolio_summary', methods=['GET'])
+def api_summary():
+    loans = load_assets_excel()
+    flows = generate_monthly_cashflows(loans)
+    return jsonify(portfolio_summary(flows, loans, warehouse_advance=0.0))
+
+###############################################################################
+# /api/recompute-cashflows
+###############################################################################
+
+@app.route("/api/recompute-cashflows", methods=["POST"])
+def api_recompute():
+    data = request.get_json()
+
+    margin_shock  = float(data.get("margin_shock_bps", 0))
+    exit_shock    = int(data.get("exit_shock_months", 0))
+    exit_multiple = float(data.get("exit_multiple", 1.0))
+    warehouse_advance = float(data.get("warehouse_advance", 0.0))
+
+    df = load_assets_excel().copy()
+
+    df["Margin"] += margin_shock / 10000.0
+    df["Exit_Date"] += pd.DateOffset(months=exit_shock)
+
+    flows = generate_monthly_cashflows(df, exit_multiple)
+    summary = portfolio_summary(flows, df, warehouse_advance)
+
+    grouped = aggregate_for_cfs(flows)
+    pivot = pivot_for_highcharts(grouped)
+    # ----------------------------------------------------------------------
+    # NEW: Build portfolio cashflow (combined inflows/outflows)
+    # ----------------------------------------------------------------------
+    port_cf = build_portfolio_cashflows(flows, df)
+    port_cf = to_month_end(port_cf)
+    port_cf = port_cf.rename(columns={"Date": "Date", "Net_Cashflow": "Net_Cashflow"})
+    # Waterfall
+    wf = run_waterfall(port_cf, warehouse_advance)
+
+    lp_perf = compute_lp_performance(wf)
+    wf_chart = waterfall_to_highcharts(wf)
+    # Merge into summary object
+    summary.update(lp_perf)
+    return jsonify({
+        "cashflows": to_highcharts(pivot),
+        "assets": df.to_dict("records"),
+        "summary": summary,
+        "waterfall": wf_chart
+    })
+
+###############################################################################
+# PRIVATE CREDIT WATERFALL (GP/LP)
+###############################################################################
+def to_month_end(df, date_col="Date"):
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col]) + pd.offsets.MonthEnd(0)
+    return df
+
+def run_waterfall(
+    cashflows_df,
+    warehouse_advance_rate,
+    mgmt_fee_rate=0.01,
+    hurdle_rate=0.05,
+    carry_rate_lp=0.85,
+    carry_rate_gp=0.15,
+    sub_line_rate=0.05
+):
+    df = cashflows_df.copy().sort_values("Date")
+
+    # State
+    lp_contrib_total = 0.0
+    lp_unreturned_capital = 0.0
+    lp_accrued_pref = 0.0
+    warehouse_balance = 0.0
+    nav = 0.0
+
+    results = []
+
+    for _, row in df.iterrows():
+        dt = row["Date"]
+        gross_income = float(row.get("Gross_Income", 0.0))
+        inflow = float(row.get("Net_Cashflow", gross_income))
+
+        # 1) CAPITAL CALLS (negative inflow)
+        if inflow < 0:
+            call = -inflow
+            warehouse_draw = warehouse_advance_rate * call
+            lp_draw = (1 - warehouse_advance_rate) * call
+
+            warehouse_balance += warehouse_draw
+            lp_contrib_total += lp_draw
+            lp_unreturned_capital += lp_draw
+            nav += call  # NAV increases by capital deployed
+
+            results.append({
+                "Date": dt,
+                "NAV": nav,
+                "Gross_Income": 0.0,
+                "Warehouse_Paid": 0.0,
+                "LP_Dist": 0.0,
+                "GP_Dist": 0.0,
+                "Warehouse_Balance": warehouse_balance,
+                "LP_Balance": lp_unreturned_capital,
+                "LP_Contrib": lp_draw
+            })
+            continue
+
+        # 2) DISTRIBUTION MONTH
+        cash = gross_income
+
+        # A. Warehouse interest (expense)
+        wh_interest = warehouse_balance * sub_line_rate / 12.0
+        wh_int_paid = min(cash, wh_interest)
+        cash -= wh_int_paid
+
+        # B. Management fee (to GP)
+        mgmt_fee = nav * mgmt_fee_rate / 12.0
+        mgmt_paid = min(cash, mgmt_fee)
+        cash -= mgmt_paid
+
+        # C. Return LP capital
+        lp_cap_return = min(cash, lp_unreturned_capital)
+        lp_unreturned_capital -= lp_cap_return
+        lp_contrib_total = max(0.0, lp_contrib_total - lp_cap_return)
+        cash -= lp_cap_return
+
+        # D. Accrue LP pref if capital outstanding
+        if lp_unreturned_capital > 0:
+            lp_accrued_pref += lp_unreturned_capital * hurdle_rate / 12.0
+
+        # E. Pay LP pref once capital is fully returned
+        lp_pref_paid = 0.0
+        if lp_unreturned_capital == 0.0 and lp_accrued_pref > 0.0:
+            lp_pref_paid = min(cash, lp_accrued_pref)
+            lp_accrued_pref -= lp_pref_paid
+            cash -= lp_pref_paid
+
+        # F. Pay warehouse principal after LP capital + pref are cleared
+        wh_prin_paid = 0.0
+        if lp_unreturned_capital == 0.0 and lp_accrued_pref == 0.0:
+            wh_prin_paid = min(cash, warehouse_balance)
+            warehouse_balance -= wh_prin_paid
+            cash -= wh_prin_paid
+
+        # G. Residual split 85/15 (no GP 100% catch-up here)
+        gp_share = 0.0
+        lp_share = 0.0
+        if lp_unreturned_capital == 0.0 and lp_accrued_pref == 0.0 and warehouse_balance == 0.0 and cash > 0.0:
+            gp_share = cash * carry_rate_gp
+            lp_share = cash * carry_rate_lp
+            cash = 0.0
+
+        # Assemble reported buckets
+        warehouse_paid = wh_int_paid + wh_prin_paid
+        lp_dist = lp_cap_return + lp_pref_paid + lp_share
+        gp_dist = mgmt_paid + gp_share
+        # Note: warehouse_paid is excluded from gp_dist to avoid overstating distributions.
+
+        # Optional sanity check
+        # total_out = warehouse_paid + lp_dist + gp_dist
+        # if abs(total_out - gross_income) > 1e-6:
+        #     print("WARN: payouts != income", dt, total_out, gross_income)
+
+        results.append({
+            "Date": dt,
+            "NAV": nav,
+            "Gross_Income": gross_income,
+            "Warehouse_Paid": warehouse_paid,
+            "LP_Dist": lp_dist,
+            "GP_Dist": gp_dist,
+            "Warehouse_Balance": warehouse_balance,
+            "LP_Balance": lp_unreturned_capital,
+            "LP_Contrib": 0.0
         })
+
+    # 3) FINAL CLEANUP
+    if results:
+        last = results[-1]
+        if last["LP_Balance"] > 0:
+            last["LP_Dist"] += last["LP_Balance"]
+            last["LP_Balance"] = 0.0
+        results[-1] = last
+
+    return pd.DataFrame(results)
+
+
+def compute_lp_performance(wf_df):
+    dates = wf_df["Date"].tolist()
+
+    # True LP contributions ONLY come from LP_Contrib
+    c = wf_df["LP_Contrib"].fillna(0).astype(float).tolist()
+    contribs = [-x for x in c]  # convert to negative cashflows
+
+    # LP distributions
+    dists = wf_df["LP_Dist"].fillna(0).astype(float).tolist()
+
+    # Net LP cashflow each month
+    lp_flows = [a + b for a, b in zip(contribs, dists)]
+    lp_gross_flows = [a + b for a, b in zip(c, dists)]  # includes contributions as negative
+
+    print("LP_Contrib:", contribs)
+    print("LP_Dist:", dists)
+    print("LP Cashflows:", lp_flows)
+
+    # Must have at least one negative and one positive
+    if not any(x < 0 for x in lp_flows) or not any(x > 0 for x in lp_flows):
+        return {"LP_Net_IRR": 0.0, "LP_Net_MOIC": 0.0}
+    
+    amounts = [sum(contribs)] + dists
+    # IRR
+    try:
+        #cf_dict = dict(zip(dates, lp_flows))
+        cf_dict = dict(zip(dates, amounts))
+        irr_annual = xirr(cf_dict)
+    except:
+        irr_annual = None
+
+    # MOIC
+    total_contrib = abs(sum(x for x in lp_flows if x < 0))
+    total_dist = sum(x for x in lp_flows if x > 0)
+    moic = total_dist / total_contrib if total_contrib else None
+
+    return {
+        "LP_Net_IRR": 0.0 if not irr_annual == irr_annual else irr_annual,
+        "LP_Net_MOIC": 0.0 if not moic == moic else moic
+    }
+
+
+def waterfall_to_highcharts(wf):
+    """
+    Converts waterfall dataframe into Highcharts format
+    Row order:
+      NAV
+      Gross_Income
+      Warehouse_Paid
+      LP_Dist
+      GP_Dist
+      Warehouse_Balance
+      LP_Balance
+    """
+
+    wf = wf.copy()
+
+    # Ensure all required columns exist
+    required_cols = [
+        "Date",
+        "NAV",
+        "Gross_Income",
+        "Warehouse_Paid",
+        "LP_Dist",
+        "GP_Dist",
+        "Warehouse_Balance",
+        "LP_Balance"
+    ]
+
+    for col in required_cols:
+        if col not in wf.columns:
+            wf[col] = 0
+
+    # Reorder explicitly
+    wf = wf[required_cols]
+
+    # Convert to wide format
+    wide = wf.set_index("Date").T.reset_index()
+    wide = wide.rename(columns={"index": "Metric"})
+
+    categories = [d.strftime("%Y-%m-%d") for d in wide.columns[1:]]
+
+    series = [
+        {
+            "name": row["Metric"],
+            "data": [row[c] for c in wide.columns[1:]]
+        }
+        for _, row in wide.iterrows()
+    ]
 
     return {
         "categories": categories,
         "series": series
     }
 
-@app.route("/api/recompute-cashflows", methods=["POST"])
-def recompute_cashflows():
-    data = request.get_json()
-    margin_shock_bps = float(data.get("margin_shock_bps", 0))
-    exit_shock_months = int(data.get("exit_shock_months", 0))
-    # Load base data
-    df = load_assets_excel("assets.xlsx").copy()
-    # Margin shock (bps → decimal)
-    margin_shock = margin_shock_bps / 10000.0
-    df["Margin"] = df["Margin"] + margin_shock
-    df["Total_Allin_Margin_Margin"] = (
-        df["Margin"] + df["Base_Rate"] + df["PIK"]
-    )
-    # Exit shock
-    df["Exit_Date"] = pd.to_datetime(df["Exit_Date"]) + pd.DateOffset(
-        months=exit_shock_months
-    )
-    # Recompute flows
-    flows = generate_monthly_cashflows(df)
-    # Pivot cashflows
-    pivot = aggregate_cashflows_for_react(flows)
-    # Format for React table
-    hc_data = to_highcharts_series(pivot)
-    return jsonify({
-        "cashflows": hc_data,
-        "assets": df.to_dict(orient="records")
-    })
-
-
-
-def compute_irr(agg_df, total_funded):
-    """
-    Computes Monthly IRR and Annualised IRR safely:
-    - Guarantees sign change
-    - Avoids NaN or None outputs
-    """
-    # Monthly net cashflows (interest + fees + principal)
-    flows = agg_df.sort_values("Date")[["Net_Cashflow"]].copy()
-    # Initial outflow
-    irr_series = [-total_funded] + list(flows["Net_Cashflow"].values)
-    # If no positive inflows exist, IRR is undefined
-    if max(irr_series) <= 0:
-        return None, None
-    # Compute IRR
-    try:
-        irr_monthly = float(np.irr(irr_series))
-    except Exception:
-        return None, None
-    if irr_monthly is None or math.isnan(irr_monthly):
-        return None, None
-    irr_annual = (1 + irr_monthly)**12 - 1
-    return irr_monthly, irr_annual
-
-def portfolio_summary(agg_df, loan_df):
-    summary = {}
-    total_funded = loan_df["Funded_EUR"].sum()
-    summary["Total_Capital_Funded"] = total_funded
-
-    summary["Start_Balance"] = agg_df["Balance_Start_EUR"].sum()
-    summary["Total_Interest_Cash"] = agg_df["Interest_Cash_EUR"].sum()
-    summary["Total_Interest_PIK"] = agg_df["Interest_PIK_EUR"].sum()
-    summary["Total_Unfunded_Fees"] = agg_df["Unfunded_Fee_EUR"].sum()
-    summary["Total_Principal_Returned"] = agg_df["Principal_EUR"].sum()
-    summary["End_Balance"] = agg_df["Balance_End_EUR"].sum()
-
-    agg_df = agg_df.copy()
-    agg_df["Net_Cashflow"] = (
-        agg_df["Interest_Cash_EUR"]
-        + agg_df["Interest_PIK_EUR"]
-        + agg_df["Unfunded_Fee_EUR"]
-        + agg_df["Principal_EUR"]
-    )
-
-    summary["Total_Net_Cashflow"] = agg_df["Net_Cashflow"].sum()
-
-    # Compute IRR safely
-    irr_monthly, irr_annual = compute_irr(agg_df, total_funded)
-    summary["IRR_Monthly"] = irr_monthly
-    summary["IRR_Annualised"] = irr_annual
-
-    # WAL
-    cashflows = agg_df.sort_values("Date")
-    total_principal = summary["Total_Principal_Returned"]
-
-    if total_principal > 0:
-        first_year = cashflows["Date"].dt.year.min()
-        months_offset = (
-            (cashflows["Date"].dt.year - first_year) * 12 +
-            cashflows["Date"].dt.month
-        )
-        WAL_months = (cashflows["Principal_EUR"] * months_offset).sum() / total_principal
-        summary["WAL_Years"] = WAL_months / 12
-    else:
-        summary["WAL_Years"] = None
-
-    # Clean NaN for JSON
-    cleaned = {
-        k: (None if isinstance(v, float) and math.isnan(v) else v)
-        for k, v in summary.items()
-    }
-
-    return cleaned
-
-
-@app.route('/api/portfolio_summary', methods=['GET'])
-def get_portfolio_summary():
-    df = load_assets_excel()
-    flows = generate_monthly_cashflows(df)
-    agg = aggregate_cashflows(flows)
-    summary = portfolio_summary(agg, df)
-    return jsonify(summary)
-
-@app.route("/debug")
-def debug():
-    import os
-    return {
-        "cwd": os.getcwd(),
-        "files": os.listdir(os.getcwd()),
-        "parent_files": os.listdir(os.path.dirname(os.getcwd())),
-        "build_exists_here": os.path.exists("build"),
-        "build_exists_parent": os.path.exists("../build"),
-        "build_static_exists": os.path.exists("build/static"),
-    }
-
-if __name__ == '__main__':
-    
+###############################################################################
+if __name__ == "__main__":
     app.run(debug=True)

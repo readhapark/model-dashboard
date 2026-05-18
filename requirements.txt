@@ -7,4 +7,5 @@ fastapi
 pydantic
 uvicorn
 numpy
-gunicorn
+numpy_financial
+pyxirr
