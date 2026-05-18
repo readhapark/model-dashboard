@@ -7,3 +7,4 @@ fastapi
 pydantic
 uvicorn
 numpy
+gunicorn
