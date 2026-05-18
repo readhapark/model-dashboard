@@ -8,21 +8,20 @@ import numpy as np
 from flask import send_from_directory
 import os
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='build/static', static_url_path='/static')
 CORS(app)
-
-
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory(os.path.join('build', 'static'), filename)
-
+# Serve static files from React build
+@app.route('/static/<path:path>')
+def serve_static(path):
+    return send_from_directory(os.path.join('build', 'static'), path)
+# Serve React App
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_react(path):
-    if path != "" and os.path.exists(os.path.join("build", path)):
-        return send_from_directory("build", path)
-    else:
-        return send_from_directory("build", "index.html")
+    full_path = os.path.join('build', path)
+    if path != "" and os.path.exists(full_path):
+        return send_from_directory('build', path)
+    return send_from_directory('build', 'index.html')
 
 @app.route('/api/add', methods=['POST'])
 def add_numbers():
