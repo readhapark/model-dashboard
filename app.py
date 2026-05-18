@@ -335,13 +335,19 @@ def get_portfolio_summary():
 
 from flask import send_from_directory
 import os
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory('build/static', filename)
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_react(path):
-    if path != "" and os.path.exists("build/" + path):
+    if path != "" and os.path.exists(os.path.join('build', path)):
         return send_from_directory('build', path)
     else:
         return send_from_directory('build', 'index.html')
+
     
 if __name__ == '__main__':
     
